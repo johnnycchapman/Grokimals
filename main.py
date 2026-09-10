@@ -5,9 +5,12 @@ Daily animal-portrait bot.
 Every morning this script:
   1. Builds a random prompt of the form
      "Create a portrait of a/an {animal} {activity} {landscape} in a {style}"
-  2. Sends it to xAI's image generation endpoint (Grok).
-  3. Upscales the result to 2K (2048 px on the long edge).
+  2. Sends it to xAI's image generation endpoint (Grok Imagine).
+  3. Encodes the result as a JPEG that fits X's 5 MB media limit.
   4. Uploads the image to X and posts it.
+
+Triggered by cron-job.org, which POSTs to the GitHub Actions workflow_dispatch
+endpoint at 08:00 America/New_York.
 
 Required environment variables:
     XAI_API_KEY              xAI API key
@@ -17,7 +20,9 @@ Required environment variables:
     X_ACCESS_TOKEN_SECRET    X access token secret
 
 Optional environment variables:
-    XAI_IMAGE_MODEL          default "grok-2-image-1212"
+    XAI_IMAGE_MODEL          default "grok-imagine-image-2.0"
+    XAI_IMAGE_QUALITY        "low", "medium" or "auto"; unset lets xAI decide
+    XAI_ASPECT_RATIO         e.g. "1:1"; unset lets the model pick per prompt
     OUTPUT_DIR               where to save the generated file, default "./output"
     DRY_RUN                  "1" to generate + save but skip posting to X
 """
@@ -72,13 +77,22 @@ LANDSCAPES = [
 # --------------------------------------------------------------------------
 
 XAI_IMAGE_URL = "https://api.x.ai/v1/images/generations"
-XAI_MODEL = os.getenv("XAI_IMAGE_MODEL", "grok-2-image-1212")
+
+# grok-2-image-1212 was retired on 2026-02-28. Requests naming it return 400.
+XAI_MODEL = os.getenv("XAI_IMAGE_MODEL", "grok-imagine-image-2.0")
+
+# "quality" is only accepted by grok-imagine-image-2.0; omitted means "auto",
+# which currently serves "low" for generation.
+XAI_QUALITY = os.getenv("XAI_IMAGE_QUALITY")
+
+# Omitted means "auto" — the model picks the ratio that suits the prompt.
+XAI_ASPECT_RATIO = os.getenv("XAI_ASPECT_RATIO")
 
 X_MEDIA_UPLOAD_URL = "https://api.x.com/2/media/upload"
 X_MEDIA_METADATA_URL = "https://api.x.com/2/media/metadata"
 X_TWEETS_URL = "https://api.x.com/2/tweets"
 
-TARGET_LONG_EDGE = 2048          # "2K" — 2048 px on the longer side
+TARGET_LONG_EDGE = 2048          # matches the "2k" resolution xAI returns
 MAX_UPLOAD_BYTES = 5 * 1024 * 1024  # X image limit is 5 MB
 REQUEST_TIMEOUT = 120
 
@@ -142,6 +156,13 @@ def with_retries(fn: Callable[[], T], *, label: str, attempts: int = 3,
             return fn()
         except requests.RequestException as exc:
             last_exc = exc
+
+            # raise_for_status() only carries the status line, so surface the
+            # response body — that is where the API names the offending field.
+            resp = getattr(exc, "response", None)
+            if resp is not None and resp.text:
+                log.warning("%s response body: %s", label, resp.text[:500])
+
             if attempt == attempts:
                 break
             delay = base_delay * (2 ** (attempt - 1))
@@ -152,11 +173,24 @@ def with_retries(fn: Callable[[], T], *, label: str, attempts: int = 3,
 
 
 # --------------------------------------------------------------------------
-# Step 1 — image generation (xAI / Grok)
+# Step 1 — image generation (xAI / Grok Imagine)
 # --------------------------------------------------------------------------
 
 def generate_image(prompt: str, api_key: str) -> bytes:
-    """Ask Grok for an image and return the raw bytes."""
+    """Ask Grok Imagine for a 2K image and return the raw bytes."""
+    payload: dict[str, Any] = {
+        "model": XAI_MODEL,
+        "prompt": prompt,
+        "n": 1,
+        "resolution": "2k",
+        "response_format": "b64_json",
+    }
+    if XAI_QUALITY:
+        payload["quality"] = XAI_QUALITY
+    if XAI_ASPECT_RATIO:
+        payload["aspect_ratio"] = XAI_ASPECT_RATIO
+
+    log.info("Requesting image from %s at 2k", XAI_MODEL)
 
     def _call() -> requests.Response:
         resp = requests.post(
@@ -165,22 +199,22 @@ def generate_image(prompt: str, api_key: str) -> bytes:
                 "Authorization": f"Bearer {api_key}",
                 "Content-Type": "application/json",
             },
-            json={
-                "model": XAI_MODEL,
-                "prompt": prompt,
-                "n": 1,
-                "response_format": "b64_json",
-            },
+            json=payload,
             timeout=REQUEST_TIMEOUT,
         )
         resp.raise_for_status()
         return resp
 
-    payload: dict[str, Any] = with_retries(_call, label="xAI image generation").json()
+    body: dict[str, Any] = with_retries(_call, label="xAI image generation").json()
 
-    items = payload.get("data") or []
+    # The response reports the model that actually served the request, which
+    # resolves any aliases or deprecation redirects.
+    if served := body.get("model"):
+        log.info("Served by model: %s", served)
+
+    items = body.get("data") or []
     if not items:
-        raise RuntimeError(f"xAI returned no image data: {payload}")
+        raise RuntimeError(f"xAI returned no image data: {body}")
 
     item = items[0]
     if revised := item.get("revised_prompt"):
@@ -189,9 +223,7 @@ def generate_image(prompt: str, api_key: str) -> bytes:
     if b64 := item.get("b64_json"):
         return base64.b64decode(b64)
     if url := item.get("url"):
-        img = with_retries(
-            lambda: _get_ok(url), label="image download"
-        )
+        img = with_retries(lambda: _get_ok(url), label="image download")
         return img.content
 
     raise RuntimeError(f"Unrecognized xAI response shape: {item}")
@@ -204,32 +236,28 @@ def _get_ok(url: str) -> requests.Response:
 
 
 # --------------------------------------------------------------------------
-# Step 2 — upscale to 2K
+# Step 2 — encode for X
 # --------------------------------------------------------------------------
 
-def upscale_to_2k(raw: bytes) -> bytes:
+def encode_for_x(raw: bytes) -> bytes:
     """
-    Resize so the long edge is TARGET_LONG_EDGE, preserving aspect ratio, and
-    encode as JPEG small enough for X's 5 MB media limit.
+    Encode as a JPEG small enough for X's 5 MB media limit.
 
-    The xAI image endpoint does not expose a size parameter, so the delivered
-    image is resampled here rather than requested at 2K directly.
+    xAI now returns 2K directly via the "resolution" parameter, so the resize
+    below is a safety net for a model that ignores it rather than the main
+    event. The quality ladder is what actually keeps the file under the cap.
     """
     with Image.open(io.BytesIO(raw)) as im:
         im = im.convert("RGB")
         w, h = im.size
         scale = TARGET_LONG_EDGE / max(w, h)
 
-        if scale > 1:
+        if scale != 1:
             new_size = (round(w * scale), round(h * scale))
-            log.info("Upscaling %dx%d -> %dx%d", w, h, *new_size)
-            im = im.resize(new_size, Image.LANCZOS)
-        elif scale < 1:
-            new_size = (round(w * scale), round(h * scale))
-            log.info("Downscaling %dx%d -> %dx%d", w, h, *new_size)
+            log.info("Resampling %dx%d -> %dx%d", w, h, *new_size)
             im = im.resize(new_size, Image.LANCZOS)
         else:
-            log.info("Image already %dx%d — no resampling needed", w, h)
+            log.info("Image arrived at %dx%d — no resampling needed", w, h)
 
         for quality in (95, 90, 85, 78, 70):
             buf = io.BytesIO()
@@ -341,7 +369,7 @@ def main() -> int:
 
     try:
         raw = generate_image(prompt, api_key)
-        image = upscale_to_2k(raw)
+        image = encode_for_x(raw)
     except Exception as exc:
         log.error("Image generation failed: %s", exc)
         return 1
