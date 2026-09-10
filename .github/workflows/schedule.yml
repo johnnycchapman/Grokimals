@@ -1,0 +1,57 @@
+name: Daily Animal Portrait
+
+# Triggered externally by cron-job.org, which POSTs to the workflow_dispatch
+# endpoint at 08:00 America/New_York. cron-job.org handles DST, so the old
+# dual-UTC-cron + hour-guard workaround is no longer needed.
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Generate the image but skip posting to X"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: daily-portrait
+  cancel-in-progress: false
+
+jobs:
+  generate-and-post:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Generate and post portrait
+        env:
+          XAI_API_KEY: ${{ secrets.XAI_API_KEY }}
+          X_CONSUMER_KEY: ${{ secrets.X_CONSUMER_KEY }}
+          X_CONSUMER_SECRET: ${{ secrets.X_CONSUMER_SECRET }}
+          X_ACCESS_TOKEN: ${{ secrets.X_ACCESS_TOKEN }}
+          X_ACCESS_TOKEN_SECRET: ${{ secrets.X_ACCESS_TOKEN_SECRET }}
+          OUTPUT_DIR: output
+          # Inputs arrive as strings over the REST API, so accept either form.
+          DRY_RUN: ${{ (inputs.dry_run == true || inputs.dry_run == 'true') && '1' || '0' }}
+        run: python daily_portrait_bot.py
+
+      - name: Archive the generated image
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: portrait-${{ github.run_id }}
+          path: output/*.jpg
+          retention-days: 30
