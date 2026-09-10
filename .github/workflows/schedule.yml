@@ -39,7 +39,7 @@ jobs:
           X_ACCESS_TOKEN: ${{ secrets.X_ACCESS_TOKEN }}
           X_ACCESS_TOKEN_SECRET: ${{ secrets.X_ACCESS_TOKEN_SECRET }}
           OUTPUT_DIR: output
-        run: python daily_portrait_bot.py
+        run: python main.py
 
       - name: Archive the generated image
         if: success()
