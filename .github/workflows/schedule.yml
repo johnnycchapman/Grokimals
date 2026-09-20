@@ -1,13 +1,14 @@
 name: Daily Animal Portrait
 
 # Triggered externally by cron-job.org, which POSTs to the workflow_dispatch
-# endpoint at 08:00 America/New_York. cron-job.org handles DST, so the old
-# dual-UTC-cron + hour-guard workaround is no longer needed.
+# endpoint at 08:00 America/New_York. cron-job.org handles DST, so there is
+# deliberately no cron expression in this file.
 on:
   workflow_dispatch:
 
+# contents: write is needed so the run can commit the counter back to the repo.
 permissions:
-  contents: read
+  contents: write
 
 concurrency:
   group: daily-portrait
@@ -39,12 +40,21 @@ jobs:
           X_ACCESS_TOKEN: ${{ secrets.X_ACCESS_TOKEN }}
           X_ACCESS_TOKEN_SECRET: ${{ secrets.X_ACCESS_TOKEN_SECRET }}
           OUTPUT_DIR: output
+          STATE_FILE: state/counter.json
         run: python main.py
 
-      - name: Archive the generated image
-        if: success()
-        uses: actions/upload-artifact@v4
-        with:
-          name: portrait-${{ github.run_id }}
-          path: output/*.jpg
-          retention-days: 30
+      # Only reached when the step above exits 0, so the committed counter
+      # always reflects a post that actually went out.
+      - name: Commit the counter
+        run: |
+          if git diff --quiet -- state/counter.json; then
+            echo "Counter unchanged — nothing to commit."
+            exit 0
+          fi
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add state/counter.json
+          git commit -m "chore: post #$(jq -r .count state/counter.json) ($(jq -r .name state/counter.json))"
+          # Another run could have landed between checkout and now.
+          git pull --rebase --autostash origin ${{ github.ref_name }}
+          git push
