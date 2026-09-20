@@ -6,8 +6,11 @@ Every morning this script:
   1. Builds a random prompt of the form
      "Create a portrait of a/an {animal} {activity} {landscape} in a {style}"
   2. Sends it to xAI's image generation endpoint (Grok Imagine).
-  3. Encodes the result as a JPEG that fits X's 5 MB media limit.
-  4. Uploads the image to X and posts it.
+  3. Asks Grok (chat completions) to name the animal in the portrait.
+  4. Encodes the result as a JPEG that fits X's 5 MB media limit.
+  5. Uploads the image to X and posts it as "#N {name}".
+  6. Bumps the counter in the state file — but only after the post succeeds,
+     so a failed run never burns a number.
 
 Triggered by cron-job.org, which POSTs to the GitHub Actions workflow_dispatch
 endpoint at 08:00 America/New_York.
@@ -23,6 +26,9 @@ Optional environment variables:
     XAI_IMAGE_MODEL          default "grok-imagine-image-2.0"
     XAI_IMAGE_QUALITY        "low", "medium" or "auto"; unset lets xAI decide
     XAI_ASPECT_RATIO         e.g. "1:1"; unset lets the model pick per prompt
+    XAI_TEXT_MODEL           default "grok-4.6"; used to name the animal
+    XAI_REASONING_EFFORT     "low"/"high"; unset lets the model decide
+    STATE_FILE               counter file, default "./state/counter.json"
     OUTPUT_DIR               where to save the generated file, default "./output"
     DRY_RUN                  "1" to generate + save but skip posting to X
 """
@@ -31,10 +37,13 @@ from __future__ import annotations
 
 import base64
 import io
+import json
 import logging
 import os
 import random
+import re
 import sys
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, TypeVar
@@ -72,11 +81,18 @@ LANDSCAPES = [
     "in a redwood grove",
 ]
 
+# Used only when Grok can't be reached for a name — the post still goes out.
+FALLBACK_NAMES = [
+    "Waffles", "Biscuit", "Pickles", "Juniper", "Marlowe", "Nugget",
+    "Clementine", "Rufus", "Olive", "Barnaby", "Poppy", "Sable",
+]
+
 # --------------------------------------------------------------------------
 # Configuration
 # --------------------------------------------------------------------------
 
 XAI_IMAGE_URL = "https://api.x.ai/v1/images/generations"
+XAI_CHAT_URL = "https://api.x.ai/v1/chat/completions"
 
 # grok-2-image-1212 was retired on 2026-02-28. Requests naming it return 400.
 XAI_MODEL = os.getenv("XAI_IMAGE_MODEL", "grok-imagine-image-2.0")
@@ -88,9 +104,15 @@ XAI_QUALITY = os.getenv("XAI_IMAGE_QUALITY")
 # Omitted means "auto" — the model picks the ratio that suits the prompt.
 XAI_ASPECT_RATIO = os.getenv("XAI_ASPECT_RATIO")
 
+# Text model that names the animal.
+XAI_TEXT_MODEL = os.getenv("XAI_TEXT_MODEL", "grok-4.6")
+XAI_REASONING_EFFORT = os.getenv("XAI_REASONING_EFFORT")
+
 X_MEDIA_UPLOAD_URL = "https://api.x.com/2/media/upload"
 X_MEDIA_METADATA_URL = "https://api.x.com/2/media/metadata"
 X_TWEETS_URL = "https://api.x.com/2/tweets"
+
+STATE_FILE = Path(os.getenv("STATE_FILE", "state/counter.json"))
 
 TARGET_LONG_EDGE = 2048          # matches the "2k" resolution xAI returns
 MAX_UPLOAD_BYTES = 5 * 1024 * 1024  # X image limit is 5 MB
@@ -126,7 +148,20 @@ def indefinite_article(word: str) -> str:
     return "an" if w[:1] in "aeiou" else "a"
 
 
-def build_prompt(rng: random.Random | None = None) -> str:
+@dataclass(frozen=True)
+class Portrait:
+    """One random portrait idea: the prompt plus the parts that built it."""
+    text: str
+    animal: str
+    activity: str
+    landscape: str
+    style: str
+
+    def __str__(self) -> str:  # so log.info("%s", portrait) still reads well
+        return self.text
+
+
+def build_prompt(rng: random.Random | None = None) -> Portrait:
     """Assemble one random prompt from the four word banks."""
     r = rng or random
     animal = r.choice(ANIMALS)
@@ -135,10 +170,12 @@ def build_prompt(rng: random.Random | None = None) -> str:
     style = r.choice(STYLES)
 
     article = indefinite_article(animal)
-    return (
+    text = (
         f"Create a portrait of {article} {animal.lower()} {activity.lower()} "
         f"{landscape} in a {style.lower()} style"
     )
+    return Portrait(text=text, animal=animal, activity=activity,
+                    landscape=landscape, style=style)
 
 
 # --------------------------------------------------------------------------
@@ -170,6 +207,45 @@ def with_retries(fn: Callable[[], T], *, label: str, attempts: int = 3,
                         label, attempt, attempts, exc, delay)
             time.sleep(delay)
     raise RuntimeError(f"{label} failed after {attempts} attempts") from last_exc
+
+
+# --------------------------------------------------------------------------
+# Counter state — the "#N" in the post
+# --------------------------------------------------------------------------
+
+def read_state(path: Path = STATE_FILE) -> dict[str, Any]:
+    """Load the counter file. A missing or unreadable file means "start at 0"."""
+    try:
+        state = json.loads(path.read_text())
+    except FileNotFoundError:
+        log.info("No state file at %s — starting the count at #1", path)
+        return {"count": 0}
+    except (OSError, json.JSONDecodeError) as exc:
+        # Refuse to guess: a corrupt file would silently restart the numbering.
+        raise RuntimeError(f"State file {path} is unreadable: {exc}") from exc
+
+    count = state.get("count", 0)
+    if not isinstance(count, int) or count < 0:
+        raise RuntimeError(f"State file {path} has a bad count: {count!r}")
+
+    log.info("Last successful post was #%d", count)
+    return state
+
+
+def write_state(path: Path, *, count: int, name: str, animal: str,
+                post_id: str, prompt: str) -> None:
+    """Record a successful post. Called only after X accepts the tweet."""
+    payload = {
+        "count": count,
+        "name": name,
+        "animal": animal,
+        "post_id": post_id,
+        "prompt": prompt,
+        "posted_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2) + "\n")
+    log.info("State updated: #%d (%s)", count, name)
 
 
 # --------------------------------------------------------------------------
@@ -236,7 +312,90 @@ def _get_ok(url: str) -> requests.Response:
 
 
 # --------------------------------------------------------------------------
-# Step 2 — encode for X
+# Step 2 — name the animal (xAI / Grok chat completions)
+# --------------------------------------------------------------------------
+
+_NAME_OK = re.compile(r"^[A-Za-z][A-Za-z'\-. ]{0,30}$")
+
+NAME_SYSTEM_PROMPT = (
+    "You name animals in illustrated portraits. Reply with the name only: "
+    "no punctuation, no quotes, no explanation, no emoji. One or two words, "
+    "at most 24 characters. Make it characterful and fitting — a name a "
+    "reader would smile at — and avoid the most obvious pet-name cliches."
+)
+
+
+def name_animal(portrait: Portrait, api_key: str) -> str:
+    """Ask Grok for a name for this animal. Falls back rather than failing."""
+    payload: dict[str, Any] = {
+        "model": XAI_TEXT_MODEL,
+        "messages": [
+            {"role": "system", "content": NAME_SYSTEM_PROMPT},
+            {"role": "user", "content": (
+                f"Name this animal: {indefinite_article(portrait.animal)} "
+                f"{portrait.animal.lower()} {portrait.activity.lower()} "
+                f"{portrait.landscape}, drawn in a {portrait.style.lower()} style."
+            )},
+        ],
+        # Reasoning models spend part of the completion budget on thinking,
+        # so leave headroom even though the answer itself is a word or two.
+        "max_tokens": 256,
+        "temperature": 1.0,
+    }
+    if XAI_REASONING_EFFORT:
+        payload["reasoning_effort"] = XAI_REASONING_EFFORT
+
+    def _call() -> requests.Response:
+        resp = requests.post(
+            XAI_CHAT_URL,
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json=payload,
+            timeout=REQUEST_TIMEOUT,
+        )
+        resp.raise_for_status()
+        return resp
+
+    try:
+        body = with_retries(_call, label="xAI naming", attempts=2).json()
+        raw = body["choices"][0]["message"]["content"] or ""
+    except Exception as exc:
+        name = random.choice(FALLBACK_NAMES)
+        log.warning("Naming failed (%s) — falling back to %s", exc, name)
+        return name
+
+    name = clean_name(raw)
+    if not name:
+        name = random.choice(FALLBACK_NAMES)
+        log.warning("Grok returned an unusable name %r — falling back to %s",
+                    raw.strip()[:60], name)
+        return name
+
+    log.info("Grok named the %s: %s", portrait.animal.lower(), name)
+    return name
+
+
+def clean_name(raw: str) -> str:
+    """Strip the model's stray punctuation and validate the shape."""
+    # Take the last non-empty line: some models prefix a throat-clear.
+    lines = [ln.strip() for ln in raw.strip().splitlines() if ln.strip()]
+    if not lines:
+        return ""
+    candidate = lines[-1]
+    # Drop a label prefix like "Name:" or "The name is:".
+    if ":" in candidate:
+        candidate = candidate.rsplit(":", 1)[1]
+    # Drop leading decoration (emoji, bullets, quotes) and trailing punctuation.
+    candidate = re.sub(r"^[^A-Za-z]+", "", candidate)
+    candidate = candidate.strip().strip("\"'`*.,!?:;()[]{}").strip()
+    candidate = re.sub(r"\s+", " ", candidate)
+    return candidate if _NAME_OK.match(candidate) else ""
+
+
+# --------------------------------------------------------------------------
+# Step 3 — encode for X
 # --------------------------------------------------------------------------
 
 def encode_for_x(raw: bytes) -> bytes:
@@ -271,7 +430,7 @@ def encode_for_x(raw: bytes) -> bytes:
 
 
 # --------------------------------------------------------------------------
-# Step 3 — upload + post to X
+# Step 4 — upload + post to X
 # --------------------------------------------------------------------------
 
 def x_auth() -> OAuth1:
@@ -364,15 +523,28 @@ def main() -> int:
     out_dir = Path(os.getenv("OUTPUT_DIR", "output"))
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    prompt = build_prompt()
-    log.info("Prompt: %s", prompt)
+    # Read the counter first: a corrupt state file should stop the run before
+    # it spends money on an image.
+    try:
+        state = read_state(STATE_FILE)
+    except RuntimeError as exc:
+        log.error("%s", exc)
+        return 1
+    next_number = state["count"] + 1
+
+    portrait = build_prompt()
+    log.info("Prompt: %s", portrait.text)
 
     try:
-        raw = generate_image(prompt, api_key)
+        raw = generate_image(portrait.text, api_key)
         image = encode_for_x(raw)
     except Exception as exc:
         log.error("Image generation failed: %s", exc)
         return 1
+
+    name = name_animal(portrait, api_key)
+    post_text = f"#{next_number} {name}"
+    log.info("Post text: %s", post_text)
 
     stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     path = out_dir / f"portrait-{stamp}.jpg"
@@ -380,17 +552,30 @@ def main() -> int:
     log.info("Saved %s", path)
 
     if dry_run:
-        log.info("DRY_RUN=1 — skipping the post to X")
+        log.info("DRY_RUN=1 — skipping the post to X and leaving the count at #%d",
+                 state["count"])
         return 0
 
     try:
         auth = x_auth()
         media_id = upload_media(image, auth, path.name)
-        set_alt_text(media_id, prompt, auth)
-        post_tweet(prompt, media_id, auth)
+        set_alt_text(media_id, portrait.text, auth)
+        post_id = post_tweet(post_text, media_id, auth)
     except Exception as exc:
-        log.error("Posting to X failed: %s", exc)
+        # The counter is untouched, so tomorrow retries this same number.
+        log.error("Posting to X failed: %s — count stays at #%d",
+                  exc, state["count"])
         return 1
+
+    try:
+        write_state(STATE_FILE, count=next_number, name=name,
+                    animal=portrait.animal, post_id=post_id,
+                    prompt=portrait.text)
+    except OSError as exc:
+        # The post is already live; don't fail the run, but shout about it,
+        # because the next run would reuse this number.
+        log.error("Posted #%d but could not write %s: %s",
+                  next_number, STATE_FILE, exc)
 
     return 0
 
