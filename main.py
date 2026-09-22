@@ -8,9 +8,8 @@ Every morning this script:
   2. Sends it to xAI's image generation endpoint (Grok Imagine).
   3. Asks Grok (chat completions) to name the animal in the portrait.
   4. Encodes the result as a JPEG that fits X's 5 MB media limit.
-  5. Uploads the image to X and posts it as "#N {name}".
-  6. Bumps the counter in the state file — but only after the post succeeds,
-     so a failed run never burns a number.
+  5. Uploads the image to X and posts it as "M/D/YYYY {name}", using
+     today's date in America/New_York.
 
 Triggered by cron-job.org, which POSTs to the GitHub Actions workflow_dispatch
 endpoint at 08:00 America/New_York.
@@ -28,7 +27,6 @@ Optional environment variables:
     XAI_ASPECT_RATIO         e.g. "1:1"; unset lets the model pick per prompt
     XAI_TEXT_MODEL           default "grok-4.6"; used to name the animal
     XAI_REASONING_EFFORT     "low"/"high"; unset lets the model decide
-    STATE_FILE               counter file, default "./state/counter.json"
     OUTPUT_DIR               where to save the generated file, default "./output"
     DRY_RUN                  "1" to generate + save but skip posting to X
 """
@@ -37,16 +35,16 @@ from __future__ import annotations
 
 import base64
 import io
-import json
 import logging
 import os
 import random
 import re
 import sys
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, TypeVar
+from zoneinfo import ZoneInfo
 
 import requests
 from PIL import Image
@@ -112,7 +110,8 @@ X_MEDIA_UPLOAD_URL = "https://api.x.com/2/media/upload"
 X_MEDIA_METADATA_URL = "https://api.x.com/2/media/metadata"
 X_TWEETS_URL = "https://api.x.com/2/tweets"
 
-STATE_FILE = Path(os.getenv("STATE_FILE", "state/counter.json"))
+# The date in the post is the bot's local date, not the runner's UTC date.
+LOCAL_TZ = ZoneInfo("America/New_York")
 
 TARGET_LONG_EDGE = 2048          # matches the "2k" resolution xAI returns
 MAX_UPLOAD_BYTES = 5 * 1024 * 1024  # X image limit is 5 MB
@@ -178,6 +177,12 @@ def build_prompt(rng: random.Random | None = None) -> Portrait:
                     landscape=landscape, style=style)
 
 
+def format_post_text(name: str, now: datetime | None = None) -> str:
+    """Build the post text: "M/D/YYYY Name", no leading zeros, Eastern date."""
+    today = (now or datetime.now(LOCAL_TZ)).astimezone(LOCAL_TZ)
+    return f"{today.month}/{today.day}/{today.year} {name}"
+
+
 # --------------------------------------------------------------------------
 # Small retry helper
 # --------------------------------------------------------------------------
@@ -207,45 +212,6 @@ def with_retries(fn: Callable[[], T], *, label: str, attempts: int = 3,
                         label, attempt, attempts, exc, delay)
             time.sleep(delay)
     raise RuntimeError(f"{label} failed after {attempts} attempts") from last_exc
-
-
-# --------------------------------------------------------------------------
-# Counter state — the "#N" in the post
-# --------------------------------------------------------------------------
-
-def read_state(path: Path = STATE_FILE) -> dict[str, Any]:
-    """Load the counter file. A missing or unreadable file means "start at 0"."""
-    try:
-        state = json.loads(path.read_text())
-    except FileNotFoundError:
-        log.info("No state file at %s — starting the count at #1", path)
-        return {"count": 0}
-    except (OSError, json.JSONDecodeError) as exc:
-        # Refuse to guess: a corrupt file would silently restart the numbering.
-        raise RuntimeError(f"State file {path} is unreadable: {exc}") from exc
-
-    count = state.get("count", 0)
-    if not isinstance(count, int) or count < 0:
-        raise RuntimeError(f"State file {path} has a bad count: {count!r}")
-
-    log.info("Last successful post was #%d", count)
-    return state
-
-
-def write_state(path: Path, *, count: int, name: str, animal: str,
-                post_id: str, prompt: str) -> None:
-    """Record a successful post. Called only after X accepts the tweet."""
-    payload = {
-        "count": count,
-        "name": name,
-        "animal": animal,
-        "post_id": post_id,
-        "prompt": prompt,
-        "posted_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-    }
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, indent=2) + "\n")
-    log.info("State updated: #%d (%s)", count, name)
 
 
 # --------------------------------------------------------------------------
@@ -523,14 +489,7 @@ def main() -> int:
     out_dir = Path(os.getenv("OUTPUT_DIR", "output"))
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # Read the counter first: a corrupt state file should stop the run before
-    # it spends money on an image.
-    try:
-        state = read_state(STATE_FILE)
-    except RuntimeError as exc:
-        log.error("%s", exc)
-        return 1
-    next_number = state["count"] + 1
+    now = datetime.now(LOCAL_TZ)
 
     portrait = build_prompt()
     log.info("Prompt: %s", portrait.text)
@@ -543,39 +502,25 @@ def main() -> int:
         return 1
 
     name = name_animal(portrait, api_key)
-    post_text = f"#{next_number} {name}"
+    post_text = format_post_text(name, now)
     log.info("Post text: %s", post_text)
 
-    stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    path = out_dir / f"portrait-{stamp}.jpg"
+    path = out_dir / f"portrait-{now:%Y-%m-%d}.jpg"
     path.write_bytes(image)
     log.info("Saved %s", path)
 
     if dry_run:
-        log.info("DRY_RUN=1 — skipping the post to X and leaving the count at #%d",
-                 state["count"])
+        log.info("DRY_RUN=1 — skipping the post to X")
         return 0
 
     try:
         auth = x_auth()
         media_id = upload_media(image, auth, path.name)
         set_alt_text(media_id, portrait.text, auth)
-        post_id = post_tweet(post_text, media_id, auth)
+        post_tweet(post_text, media_id, auth)
     except Exception as exc:
-        # The counter is untouched, so tomorrow retries this same number.
-        log.error("Posting to X failed: %s — count stays at #%d",
-                  exc, state["count"])
+        log.error("Posting to X failed: %s", exc)
         return 1
-
-    try:
-        write_state(STATE_FILE, count=next_number, name=name,
-                    animal=portrait.animal, post_id=post_id,
-                    prompt=portrait.text)
-    except OSError as exc:
-        # The post is already live; don't fail the run, but shout about it,
-        # because the next run would reuse this number.
-        log.error("Posted #%d but could not write %s: %s",
-                  next_number, STATE_FILE, exc)
 
     return 0
 
