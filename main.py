@@ -10,6 +10,7 @@ Every morning this script:
   4. Encodes the result as a JPEG that fits X's 5 MB media limit.
   5. Uploads the image to X and posts it as "M/D/YYYY {name}", using
      today's date in America/New_York.
+  6. Appends "Name,URL,Date" to log.csv — only after the post succeeds.
 
 Triggered by cron-job.org, which POSTs to the GitHub Actions workflow_dispatch
 endpoint at 08:00 America/New_York.
@@ -27,6 +28,8 @@ Optional environment variables:
     XAI_ASPECT_RATIO         e.g. "1:1"; unset lets the model pick per prompt
     XAI_TEXT_MODEL           default "grok-4.6"; used to name the animal
     XAI_REASONING_EFFORT     "low"/"high"; unset lets the model decide
+    X_HANDLE                 account handle used to build post URLs, default "grokimals"
+    LOG_FILE                 CSV log of posts, default "./log.csv"
     OUTPUT_DIR               where to save the generated file, default "./output"
     DRY_RUN                  "1" to generate + save but skip posting to X
 """
@@ -34,6 +37,7 @@ Optional environment variables:
 from __future__ import annotations
 
 import base64
+import csv
 import io
 import logging
 import os
@@ -110,6 +114,10 @@ X_MEDIA_UPLOAD_URL = "https://api.x.com/2/media/upload"
 X_MEDIA_METADATA_URL = "https://api.x.com/2/media/metadata"
 X_TWEETS_URL = "https://api.x.com/2/tweets"
 
+X_HANDLE = os.getenv("X_HANDLE", "grokimals").lstrip("@")
+LOG_FILE = Path(os.getenv("LOG_FILE", "log.csv"))
+LOG_HEADER = ["Name", "URL", "Date"]
+
 # The date in the post is the bot's local date, not the runner's UTC date.
 LOCAL_TZ = ZoneInfo("America/New_York")
 
@@ -181,6 +189,21 @@ def format_post_text(name: str, now: datetime | None = None) -> str:
     """Build the post text: "M/D/YYYY Name", no leading zeros, Eastern date."""
     today = (now or datetime.now(LOCAL_TZ)).astimezone(LOCAL_TZ)
     return f"{today.month}/{today.day}/{today.year} {name}"
+
+
+def append_log(path: Path, *, name: str, post_id: str, when: datetime) -> None:
+    """Add one row to the CSV log, writing the header if the file is new."""
+    url = f"https://x.com/{X_HANDLE}/status/{post_id}"
+    date = f"{when.month}-{when.day}-{when.year}"
+    is_new = not path.exists() or path.stat().st_size == 0
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        if is_new:
+            writer.writerow(LOG_HEADER)
+        writer.writerow([name, url, date])
+    log.info("Logged to %s: %s, %s, %s", path, name, url, date)
 
 
 # --------------------------------------------------------------------------
@@ -517,10 +540,16 @@ def main() -> int:
         auth = x_auth()
         media_id = upload_media(image, auth, path.name)
         set_alt_text(media_id, portrait.text, auth)
-        post_tweet(post_text, media_id, auth)
+        post_id = post_tweet(post_text, media_id, auth)
     except Exception as exc:
         log.error("Posting to X failed: %s", exc)
         return 1
+
+    try:
+        append_log(LOG_FILE, name=name, post_id=post_id, when=now)
+    except OSError as exc:
+        # The post is already live; don't fail the run over the log.
+        log.error("Posted but could not write %s: %s", LOG_FILE, exc)
 
     return 0
 
