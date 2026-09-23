@@ -10,7 +10,7 @@ Every morning this script:
   4. Encodes the result as a JPEG that fits X's 5 MB media limit.
   5. Uploads the image to X and posts it as "M/D/YYYY {name}", using
      today's date in America/New_York.
-  6. Appends "Name,URL,Date" to log.csv — only after the post succeeds.
+  6. Appends "Name,URL,Prompt,Date" to log.csv — only after the post succeeds.
 
 Triggered by cron-job.org, which POSTs to the GitHub Actions workflow_dispatch
 endpoint at 08:00 America/New_York.
@@ -116,7 +116,8 @@ X_TWEETS_URL = "https://api.x.com/2/tweets"
 
 X_HANDLE = os.getenv("X_HANDLE", "grokimals").lstrip("@")
 LOG_FILE = Path(os.getenv("LOG_FILE", "log.csv"))
-LOG_HEADER = ["Name", "URL", "Date"]
+LOG_HEADER = ["Name", "URL", "Prompt", "Date"]
+_OLD_LOG_HEADER = ["Name", "URL", "Date"]
 
 # The date in the post is the bot's local date, not the runner's UTC date.
 LOCAL_TZ = ZoneInfo("America/New_York")
@@ -191,19 +192,37 @@ def format_post_text(name: str, now: datetime | None = None) -> str:
     return f"{today.month}/{today.day}/{today.year} {name}"
 
 
-def append_log(path: Path, *, name: str, post_id: str, when: datetime) -> None:
+def _upgrade_old_log(path: Path) -> None:
+    """One-time: turn an old Name,URL,Date log into Name,URL,Prompt,Date."""
+    with path.open(newline="", encoding="utf-8") as f:
+        rows = list(csv.reader(f))
+    if not rows or rows[0] == LOG_HEADER:
+        return
+    if rows[0] == _OLD_LOG_HEADER:
+        upgraded = [LOG_HEADER] + [
+            [r[0], r[1], "", r[2]] for r in rows[1:] if len(r) >= 3
+        ]
+        with path.open("w", newline="", encoding="utf-8") as f:
+            csv.writer(f).writerows(upgraded)
+        log.info("Upgraded %s to the Name,URL,Prompt,Date layout", path)
+
+
+def append_log(path: Path, *, name: str, post_id: str, prompt: str,
+               when: datetime) -> None:
     """Add one row to the CSV log, writing the header if the file is new."""
     url = f"https://x.com/{X_HANDLE}/status/{post_id}"
     date = f"{when.month}-{when.day}-{when.year}"
-    is_new = not path.exists() or path.stat().st_size == 0
+    exists = path.exists() and path.stat().st_size > 0
 
     path.parent.mkdir(parents=True, exist_ok=True)
+    if exists:
+        _upgrade_old_log(path)
     with path.open("a", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
-        if is_new:
+        if not exists:
             writer.writerow(LOG_HEADER)
-        writer.writerow([name, url, date])
-    log.info("Logged to %s: %s, %s, %s", path, name, url, date)
+        writer.writerow([name, url, prompt, date])
+    log.info("Logged to %s: %s, %s, %s, %s", path, name, url, prompt, date)
 
 
 # --------------------------------------------------------------------------
@@ -546,7 +565,8 @@ def main() -> int:
         return 1
 
     try:
-        append_log(LOG_FILE, name=name, post_id=post_id, when=now)
+        append_log(LOG_FILE, name=name, post_id=post_id,
+                   prompt=portrait.text, when=now)
     except OSError as exc:
         # The post is already live; don't fail the run over the log.
         log.error("Posted but could not write %s: %s", LOG_FILE, exc)
